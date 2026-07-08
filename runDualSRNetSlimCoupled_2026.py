@@ -5,8 +5,8 @@ Double 2D super resolution method
 #TODO: write up testing section if train if test. enable substacking!
 #from __future__ import absolute_import, division, print_function, unicode_literals
 import tensorflow as tf
-import tensorflow.keras.backend as K
-from tensorflow.keras.mixed_precision import experimental as mixed_precision
+from keras import backend as K
+from keras import mixed_precision
 import dualSRNetArgs
 import tifffile
 # Helper libraries
@@ -26,24 +26,27 @@ print(tf.__version__)
 
 args=dualSRNetArgs.args() # args is global
 
-gpuList=args.gpuIDs
-args.numGPUs = len(gpuList.split(','))
-if args.numGPUs<=4:
-    os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   
-    os.environ["CUDA_VISIBLE_DEVICES"]=gpuList
+gpuList = ','.join([g.strip() for g in args.gpuIDs.split(',') if g.strip()])
+args.numGPUs = len(gpuList.split(',')) if gpuList else 0
+if 0 < args.numGPUs <= 4:
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpuList
+elif args.numGPUs == 0:
+    print('No GPUs specified; using CPU.')
 
 if args.mixedPrecision:
     policy = mixed_precision.Policy('mixed_float16')
     mixed_precision.set_policy(policy)
 else:
     policy = mixed_precision.Policy('float32')
-    mixed_precision.set_policy(policy)
+    mixed_precision.set_global_policy(policy)
 print('Compute dtype: %s' % policy.compute_dtype)
 print('Variable dtype: %s' % policy.variable_dtype)
 
 # detect hardware
-if len(args.gpuIDs.split(','))<=1:
-    strategy = tf.distribute.OneDeviceStrategy(device="/gpu:0")
+if args.numGPUs <= 1:
+    device = "/gpu:0" if args.numGPUs == 1 else "/cpu:0"
+    strategy = tf.distribute.OneDeviceStrategy(device=device)
 else:
     #strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy()
     strategy = tf.distribute.MirroredStrategy()
@@ -425,47 +428,50 @@ with strategy.scope():
 
         generator = edsr(scale=args.scale, num_filters=args.ngsrf, num_res_blocks=args.numResBlocks, ndims=2)
         generator.summary(200)
-        optimizerGenerator = tf.keras.optimizers.Adam(lr=args.lr)
-        optimizerGenerator = mixed_precision.LossScaleOptimizer(optimizerGenerator, loss_scale='dynamic')
+        optimizerGenerator = tf.keras.optimizers.Adam(learning_rate=args.lr)
+        optimizerGenerator = mixed_precision.LossScaleOptimizer(optimizerGenerator)
         return generator, optimizerGenerator            
         
     def createSRCGenerator(args):
 
         generator = edsr1D(scale=args.scale, num_filters=args.ngsrf//2, num_res_blocks=args.numResBlocks//2, ndims=2)
         generator.summary(200)
-        optimizerGenerator = tf.keras.optimizers.Adam(lr=args.lr)
-        optimizerGenerator = mixed_precision.LossScaleOptimizer(optimizerGenerator, loss_scale='dynamic')
+        optimizerGenerator = tf.keras.optimizers.Adam(learning_rate=args.lr)
+        optimizerGenerator = mixed_precision.LossScaleOptimizer(optimizerGenerator)
         return generator, optimizerGenerator            
+
+    class DummyDiscriminator(tf.keras.Model):
+        def call(self, x, training=False):
+            return x
 
     def createSRDiscriminator(args):
         if args.ganFlag:
             discriminator = DiscriminatorSRGAN(args)
-            optimizerDiscriminator = tf.keras.optimizers.Adam(lr=args.lr)    
+            optimizerDiscriminator = tf.keras.optimizers.Adam(learning_rate=args.lr)    
         else:
-            a = tf.keras.layers.Input(shape=(1,))
-            b = a
-            discriminator = tf.keras.models.Model(inputs=a, outputs=b)
-            optimizerDiscriminator = tf.keras.optimizers.Adam(lr=args.lr)        
-        optimizerDiscriminator = mixed_precision.LossScaleOptimizer(optimizerDiscriminator, loss_scale='dynamic')     
-        discriminator.summary(200)
+            discriminator = DummyDiscriminator()
+            optimizerDiscriminator = tf.keras.optimizers.Adam(learning_rate=args.lr)        
+        optimizerDiscriminator = mixed_precision.LossScaleOptimizer(optimizerDiscriminator)     
+        if args.ganFlag:
+            discriminator.summary(200)
         return discriminator, optimizerDiscriminator
         
     def createSRDiscriminator3D(args):
         if args.ganFlag:
             discriminator = DiscriminatorSRGAN3D(args)
-            optimizerDiscriminator = tf.keras.optimizers.Adam(lr=args.lr)    
+            optimizerDiscriminator = tf.keras.optimizers.Adam(learning_rate=args.lr)    
         else:
-            a = tf.keras.layers.Input(shape=(1,))
-            b = a
-            discriminator = tf.keras.models.Model(inputs=a, outputs=b)
-            optimizerDiscriminator = tf.keras.optimizers.Adam(lr=args.lr)        
-        optimizerDiscriminator = mixed_precision.LossScaleOptimizer(optimizerDiscriminator, loss_scale='dynamic')     
-        discriminator.summary(200)
+            discriminator = DummyDiscriminator()
+            optimizerDiscriminator = tf.keras.optimizers.Adam(learning_rate=args.lr)        
+        optimizerDiscriminator = mixed_precision.LossScaleOptimizer(optimizerDiscriminator)     
+        if args.ganFlag:
+            discriminator.summary(200)
         return discriminator, optimizerDiscriminator
 
     # define the actions taken per iteration (calc grads and make an optim step)
     def train_step(HRBatch,BCBatch):
         Cxyz, Bxy =  HRBatch, BCBatch # make sure the dims are correct
+        print(f"Cxyz shape: {Cxyz.shape}, Bxy shape: {Bxy.shape}")
         if args.augFlag:
             Bxy = augmentData(Bxy)
         # train
@@ -484,7 +490,9 @@ with strategy.scope():
             
             Cxyd=tf.image.resize(tf.squeeze(Cxyz),[Cxyz.shape[0]//args.scale,Cxyz.shape[2]],method='bicubic')
             Cxyd=tf.expand_dims(Cxyd,3)
+            print(f"Cxyd shape: {Cxyd.shape}")
             SRxy = generatorSR(Bxy, training=True)
+            print(f"SRxy shape: {SRxy.shape}")
             totalGsrXYLoss = meanAbsoluteError(Cxyd, SRxy)
             
             if args.ganFlag:
@@ -504,11 +512,13 @@ with strategy.scope():
             # transpose the volume
             SRxy = tf.transpose(SRxy,perm=[1,0,2,3])
             Cxyz = tf.transpose(Cxyz,perm=[1,0,2,3])
+            print(f"SRxy shape after transpose: {SRxy.shape}, Cxyz shape after transpose: {Cxyz.shape}")
             
             # resize the slices
             # SRxyd=tf.image.resize(SRxy,[SRxy.shape[1],SRxy.shape[2]//args.scale],method='bicubic')
             
             SRxyz = generatorSRC(SRxy, training=True)
+            print(f"SRxyz shape: {SRxyz.shape}")
             totalGsrYZLoss = meanAbsoluteError(Cxyz, SRxyz)
          
             if args.ganFlag:
@@ -535,19 +545,19 @@ with strategy.scope():
             gradDsrXY = tape.gradient(totalDsrXYLossScal, discriminatorSR.trainable_variables)
             gradDsrYZ = tape.gradient(totalDsrYZLossScal, discriminatorSRC.trainable_variables)
             
-        # unscale gradients
-        gradGsr = optimizerGeneratorSR.get_unscaled_gradients(gradGsr)
-        gradGsrc = optimizerGeneratorSRC.get_unscaled_gradients(gradGsrc)
+	# get unscaled gradients
+        unsc_gradGsr = optimizerGeneratorSR.get_unscaled_gradients(gradGsr)
+        unsc_gradGsrc = optimizerGeneratorSRC.get_unscaled_gradients(gradGsrc)
         if args.ganFlag:
-            gradDsrXY = optimizerDiscriminatorSR.get_unscaled_gradients(gradDsrXY)
-            gradDsrYZ = optimizerDiscriminatorSRC.get_unscaled_gradients(gradDsrYZ)
-            
+            unsc_gradDsrXY = optimizerDiscriminatorSR.get_unscaled_gradients(gradDsrXY)
+            unsc_gradDsrYZ = optimizerDiscriminatorSRC.get_unscaled_gradients(gradDsrYZ)
+	
         # apply gradients
-        optimizerGeneratorSR.apply_gradients(zip(gradGsr,generatorSR.trainable_variables))
-        optimizerGeneratorSRC.apply_gradients(zip(gradGsrc,generatorSRC.trainable_variables))
+        optimizerGeneratorSR.apply_gradients(zip(unsc_gradGsr,generatorSR.trainable_variables))
+        optimizerGeneratorSRC.apply_gradients(zip(unsc_gradGsrc,generatorSRC.trainable_variables))
         if args.ganFlag:
-            optimizerDiscriminatorSR.apply_gradients(zip(gradDsrXY,discriminatorSR.trainable_variables))
-            optimizerDiscriminatorSRC.apply_gradients(zip(gradDsrYZ,discriminatorSRC.trainable_variables))
+            optimizerDiscriminatorSR.apply_gradients(zip(unsc_gradDsrXY,discriminatorSR.trainable_variables))
+            optimizerDiscriminatorSRC.apply_gradients(zip(unsc_gradDsrYZ,discriminatorSRC.trainable_variables))
             
         return totalGsrXYLoss, totalGsrYZLoss, advsrXYLoss, dsrXYLoss, advsrYZLoss, dsrYZLoss
 
@@ -567,8 +577,8 @@ with strategy.scope():
     if args.continue_train or args.phase == 'test': # restore the weights if requested, or if testing
         print(f'Loading checkpoints from {trainingDir} for epoch {args.continueEpoch}')
         try:
-            generatorSR.load_weights(f'{trainingDir}/GSR-{args.continueEpoch}/GSR')
-            generatorSRC.load_weights(f'{trainingDir}/GSRC-{args.continueEpoch}/GSRC')
+            generatorSR.load_weights(f'{trainingDir}/GSR-{args.continueEpoch}.weights.h5')
+            generatorSRC.load_weights(f'{trainingDir}/GSRC-{args.continueEpoch}.weights.h5')
         except:
             print('Could not load SR related weights')
             
@@ -586,20 +596,26 @@ with strategy.scope():
         rightNow=datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         trainOutputDir=f'./training_outputs/{rightNow}-distNN-{valoutDir}-{args.modelName}/'
         if not os.path.exists(trainingDir):
-            os.mkdir(trainingDir)
-        os.mkdir(trainOutputDir)
+            os.makedirs(trainingDir, exist_ok=True)
+        os.makedirs(trainOutputDir, exist_ok=True)
 
         print('2D/3D training specified, datasets will be randomly mini-batched per epoch')
         print('2D/3D dataset and training -> data will be fully preloaded into RAM')
         
         BCLoc=glob(args.dataset_dir+'LR/LR.npy')
         LRxy=np.load(BCLoc[0])
-        #LRxy=np.transpose(LRxy,[2,1,0])
+        
+        # commented removed
+        # LRxy=np.transpose(LRxy,[2,1,0])
 
         
         HRLoc=glob(args.dataset_dir+'HR/HR.npy')
         HR=np.load(HRLoc[0])
-        #HR=np.transpose(HR,[2,1,0])
+
+        # commented removed
+        # HR=np.transpose(HR,[2,1,0])
+        
+        
         if args.valTest:
             LRTestLoc=glob(args.dataset_dir+'test/*')
             LRTest=np.load(LRTestLoc[0])
@@ -759,26 +775,27 @@ with strategy.scope():
                     image_path = f'./{trainOutputDir}/epoch-{epoch+1}/testSRxy.tif'
                     testSRxy=(testSRxy+1)*127.5
                     tifffile.imwrite(image_path, np.array(np.squeeze(testSRxy.astype('uint8')), dtype='uint8'))
-                        
+
             if (epoch) % args.save_freq == 0:
                 #checkpoint.save(checkpoint_prefix)
                 print('Saving network weights (archive)')
-                generatorSR.save_weights(f'{trainingDir}/GSR-{epoch}/GSR')
-                generatorSRC.save_weights(f'{trainingDir}/GSRC-{epoch}/GSRC')
+                generatorSR.save_weights(f'{trainingDir}/GSR-{epoch}.weights.h5')
+                generatorSRC.save_weights(f'{trainingDir}/GSRC-{epoch}.weights.h5')
                 if args.ganFlag:
-                    discriminatorSR.save_weights(f'{trainingDir}/DSR-{epoch}/DSR')
-                    discriminatorSRC.save_weights(f'{trainingDir}/DSRC-{epoch}/DSRC')
-                        
+                    discriminatorSR.save_weights(f'{trainingDir}/DSR-{epoch}.weights.h5')
+                    discriminatorSRC.save_weights(f'{trainingDir}/DSRC-{epoch}.weights.h5')
+
                 print('Saving network weights (rewritable checkpoint)')
-                generatorSR.save_weights(f'{trainingDir}/GSR/GSR')
-                generatorSRC.save_weights(f'{trainingDir}/GSRC/GSRC')
+                generatorSR.save_weights(f'{trainingDir}/GSR.weights.h5')
+                generatorSRC.save_weights(f'{trainingDir}/GSRC.weights.h5')
                 if args.ganFlag:
-                    discriminatorSR.save_weights(f'{trainingDir}/DSR/DSR')
-                    discriminatorSRC.save_weights(f'{trainingDir}/DSRC/DSRC')
-                    
+                    discriminatorSR.save_weights(f'{trainingDir}/DSR.weights.h5')
+                    discriminatorSRC.save_weights(f'{trainingDir}/DSRC.weights.h5')
+
                 print('Saving model (rewritable checkpoint)')
-                generatorSR.save(f'{trainingDir}/GSR-{epoch}.h5')
-                generatorSRC.save(f'{trainingDir}/GSRC-{epoch}.h5')
+                generatorSR.save(f'{trainingDir}/GSR-{epoch}.keras')
+                generatorSRC.save(f'{trainingDir}/GSRC-{epoch}.keras')
+
 
 
     elif args.phase == 'testSmall':
@@ -983,5 +1000,4 @@ with strategy.scope():
 #            ABsr=tf.math.round(ABsr)
 #            ABsr=np.asarray(ABsr,'uint8')
 #            imageio.imwrite(f'{args.test_save_dir}/{args.modelName}/{fileName}_result_SRxyz_{j}.png', ABsr)
-
 
